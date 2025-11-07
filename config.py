@@ -1,165 +1,129 @@
-""" Model / Layer Config singleton state
-"""
-import os
-import warnings
-from typing import Any, Optional
-
-import torch
-
-__all__ = [
-    'is_exportable', 'is_scriptable', 'is_no_jit', 'use_fused_attn',
-    'set_exportable', 'set_scriptable', 'set_no_jit', 'set_layer_config', 'set_fused_attn',
-    'set_reentrant_ckpt', 'use_reentrant_ckpt'
-]
-
-# Set to True if prefer to have layers with no jit optimization (includes activations)
-_NO_JIT = False
-
-# Set to True if prefer to have activation layers with no jit optimization
-# NOTE not currently used as no difference between no_jit and no_activation jit as only layers obeying
-# the jit flags so far are activations. This will change as more layers are updated and/or added.
-_NO_ACTIVATION_JIT = False
-
-# Set to True if exporting a model with Same padding via ONNX
-_EXPORTABLE = False
-
-# Set to True if wanting to use torch.jit.script on a model
-_SCRIPTABLE = False
+import logging
+from .constants import *
 
 
-# use torch.scaled_dot_product_attention where possible
-_HAS_FUSED_ATTN = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-if 'TIMM_FUSED_ATTN' in os.environ:
-    _USE_FUSED_ATTN = int(os.environ['TIMM_FUSED_ATTN'])
-else:
-    _USE_FUSED_ATTN = 1  # 0 == off, 1 == on (for tested use), 2 == on (for experimental use)
+_logger = logging.getLogger(__name__)
 
 
-if 'TIMM_REENTRANT_CKPT' in os.environ:
-    _USE_REENTRANT_CKPT = bool(os.environ['TIMM_REENTRANT_CKPT'])
-else:
-    _USE_REENTRANT_CKPT = False  # defaults to disabled (off)
+def resolve_data_config(
+        args=None,
+        pretrained_cfg=None,
+        model=None,
+        use_test_size=False,
+        verbose=False
+):
+    assert model or args or pretrained_cfg, "At least one of model, args, or pretrained_cfg required for data config."
+    args = args or {}
+    pretrained_cfg = pretrained_cfg or {}
+    if not pretrained_cfg and model is not None and hasattr(model, 'pretrained_cfg'):
+        pretrained_cfg = model.pretrained_cfg
+    data_config = {}
 
+    # Resolve input/image size
+    in_chans = 3
+    if args.get('in_chans', None) is not None:
+        in_chans = args['in_chans']
+    elif args.get('chans', None) is not None:
+        in_chans = args['chans']
 
-def is_no_jit():
-    return _NO_JIT
-
-
-class set_no_jit:
-    def __init__(self, mode: bool) -> None:
-        global _NO_JIT
-        self.prev = _NO_JIT
-        _NO_JIT = mode
-
-    def __enter__(self) -> None:
-        pass
-
-    def __exit__(self, *args: Any) -> bool:
-        global _NO_JIT
-        _NO_JIT = self.prev
-        return False
-
-
-def is_exportable():
-    return _EXPORTABLE
-
-
-class set_exportable:
-    def __init__(self, mode: bool) -> None:
-        global _EXPORTABLE
-        self.prev = _EXPORTABLE
-        _EXPORTABLE = mode
-
-    def __enter__(self) -> None:
-        pass
-
-    def __exit__(self, *args: Any) -> bool:
-        global _EXPORTABLE
-        _EXPORTABLE = self.prev
-        return False
-
-
-def is_scriptable():
-    return _SCRIPTABLE
-
-
-class set_scriptable:
-    def __init__(self, mode: bool) -> None:
-        global _SCRIPTABLE
-        self.prev = _SCRIPTABLE
-        _SCRIPTABLE = mode
-
-    def __enter__(self) -> None:
-        pass
-
-    def __exit__(self, *args: Any) -> bool:
-        global _SCRIPTABLE
-        _SCRIPTABLE = self.prev
-        return False
-
-
-class set_layer_config:
-    """ Layer config context manager that allows setting all layer config flags at once.
-    If a flag arg is None, it will not change the current value.
-    """
-    def __init__(
-            self,
-            scriptable: Optional[bool] = None,
-            exportable: Optional[bool] = None,
-            no_jit: Optional[bool] = None,
-            no_activation_jit: Optional[bool] = None):
-        global _SCRIPTABLE
-        global _EXPORTABLE
-        global _NO_JIT
-        global _NO_ACTIVATION_JIT
-        self.prev = _SCRIPTABLE, _EXPORTABLE, _NO_JIT, _NO_ACTIVATION_JIT
-        if scriptable is not None:
-            _SCRIPTABLE = scriptable
-        if exportable is not None:
-            _EXPORTABLE = exportable
-        if no_jit is not None:
-            _NO_JIT = no_jit
-        if no_activation_jit is not None:
-            _NO_ACTIVATION_JIT = no_activation_jit
-
-    def __enter__(self) -> None:
-        pass
-
-    def __exit__(self, *args: Any) -> bool:
-        global _SCRIPTABLE
-        global _EXPORTABLE
-        global _NO_JIT
-        global _NO_ACTIVATION_JIT
-        _SCRIPTABLE, _EXPORTABLE, _NO_JIT, _NO_ACTIVATION_JIT = self.prev
-        return False
-
-
-def use_fused_attn(experimental: bool = False) -> bool:
-    # NOTE: ONNX export cannot handle F.scaled_dot_product_attention as of pytorch 2.0
-    if not _HAS_FUSED_ATTN or _EXPORTABLE:
-        return False
-    if experimental:
-        return _USE_FUSED_ATTN > 1
-    return _USE_FUSED_ATTN > 0
-
-
-def set_fused_attn(enable: bool = True, experimental: bool = False):
-    global _USE_FUSED_ATTN
-    if not _HAS_FUSED_ATTN:
-        warnings.warn('This version of pytorch does not have F.scaled_dot_product_attention, fused_attn flag ignored.')
-        return
-    if experimental and enable:
-        _USE_FUSED_ATTN = 2
-    elif enable:
-        _USE_FUSED_ATTN = 1
+    input_size = (in_chans, 224, 224)
+    if args.get('input_size', None) is not None:
+        assert isinstance(args['input_size'], (tuple, list))
+        assert len(args['input_size']) == 3
+        input_size = tuple(args['input_size'])
+        in_chans = input_size[0]  # input_size overrides in_chans
+    elif args.get('img_size', None) is not None:
+        assert isinstance(args['img_size'], int)
+        input_size = (in_chans, args['img_size'], args['img_size'])
     else:
-        _USE_FUSED_ATTN = 0
+        if use_test_size and pretrained_cfg.get('test_input_size', None) is not None:
+            input_size = pretrained_cfg['test_input_size']
+        elif pretrained_cfg.get('input_size', None) is not None:
+            input_size = pretrained_cfg['input_size']
+    data_config['input_size'] = input_size
+
+    # resolve interpolation method
+    data_config['interpolation'] = 'bicubic'
+    if args.get('interpolation', None):
+        data_config['interpolation'] = args['interpolation']
+    elif pretrained_cfg.get('interpolation', None):
+        data_config['interpolation'] = pretrained_cfg['interpolation']
+
+    # resolve dataset + model mean for normalization
+    data_config['mean'] = IMAGENET_DEFAULT_MEAN
+    if args.get('mean', None) is not None:
+        mean = tuple(args['mean'])
+        if len(mean) == 1:
+            mean = tuple(list(mean) * in_chans)
+        else:
+            assert len(mean) == in_chans
+        data_config['mean'] = mean
+    elif pretrained_cfg.get('mean', None):
+        data_config['mean'] = pretrained_cfg['mean']
+
+    # resolve dataset + model std deviation for normalization
+    data_config['std'] = IMAGENET_DEFAULT_STD
+    if args.get('std', None) is not None:
+        std = tuple(args['std'])
+        if len(std) == 1:
+            std = tuple(list(std) * in_chans)
+        else:
+            assert len(std) == in_chans
+        data_config['std'] = std
+    elif pretrained_cfg.get('std', None):
+        data_config['std'] = pretrained_cfg['std']
+
+    # resolve default inference crop
+    crop_pct = DEFAULT_CROP_PCT
+    if args.get('crop_pct', None):
+        crop_pct = args['crop_pct']
+    else:
+        if use_test_size and pretrained_cfg.get('test_crop_pct', None):
+            crop_pct = pretrained_cfg['test_crop_pct']
+        elif pretrained_cfg.get('crop_pct', None):
+            crop_pct = pretrained_cfg['crop_pct']
+    data_config['crop_pct'] = crop_pct
+
+    # resolve default crop percentage
+    crop_mode = DEFAULT_CROP_MODE
+    if args.get('crop_mode', None):
+        crop_mode = args['crop_mode']
+    elif pretrained_cfg.get('crop_mode', None):
+        crop_mode = pretrained_cfg['crop_mode']
+    data_config['crop_mode'] = crop_mode
+
+    if verbose:
+        _logger.info('Data processing configuration for current model + dataset:')
+        for n, v in data_config.items():
+            _logger.info('\t%s: %s' % (n, str(v)))
+
+    return data_config
 
 
-def use_reentrant_ckpt() -> bool:
-    return _USE_REENTRANT_CKPT
+def resolve_model_data_config(
+        model,
+        args=None,
+        pretrained_cfg=None,
+        use_test_size=False,
+        verbose=False,
+):
+    """ Resolve Model Data Config
+    This is equivalent to resolve_data_config() but with arguments re-ordered to put model first.
 
+    Args:
+        model (nn.Module): the model instance
+        args (dict): command line arguments / configuration in dict form (overrides pretrained_cfg)
+        pretrained_cfg (dict): pretrained model config (overrides pretrained_cfg attached to model)
+        use_test_size (bool): use the test time input resolution (if one exists) instead of default train resolution
+        verbose (bool): enable extra logging of resolved values
 
-def set_reentrant_ckpt(enable: bool = True):
-    global _USE_REENTRANT_CKPT
-    _USE_REENTRANT_CKPT = enable
+    Returns:
+        dictionary of config
+    """
+    return resolve_data_config(
+        args=args,
+        pretrained_cfg=pretrained_cfg,
+        model=model,
+        use_test_size=use_test_size,
+        verbose=verbose,
+    )
